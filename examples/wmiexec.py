@@ -1,11 +1,28 @@
 #!/usr/bin/env python
+# SECUREAUTH LABS. Copyright 2018 SecureAuth Corporation. All rights reserved.
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
 # for more information.
 #
-#  SMB DCE/RPC 
+# A similar approach to smbexec but executing commands through WMI.
+# Main advantage here is it runs under the user (has to be Admin) 
+# account, not SYSTEM, plus, it doesn't generate noisy messages
+# in the event log that smbexec.py does when creating a service.
+# Drawback is it needs DCOM, hence, I have to be able to access 
+# DCOM ports at the target machine.
 #
+# Author:
+#  beto (@agsolino)
+#
+# Reference for:
+# 
+# This software is provided under under a slightly modified version
+# of the Apache Software License. See the accompanying LICENSE file
+# for more information.
+#
+#  SMB DCE/RPC 
+#  DCOM
 
 import sys
 import time

@@ -1,361 +1,671 @@
 #!/usr/bin/env python
-# SECUREAUTH LABS. Copyright 2018 SecureAuth Corporation. All rights reserved.
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
 # for more information.
 #
-# A similar approach to smbexec but executing commands through WMI.
-# Main advantage here is it runs under the user (has to be Admin) 
-# account, not SYSTEM, plus, it doesn't generate noisy messages
-# in the event log that smbexec.py does when creating a service.
-# Drawback is it needs DCOM, hence, I have to be able to access 
-# DCOM ports at the target machine.
-#
-# Author:
-#  beto (@agsolino)
-#
-# Reference for:
-#  DCOM
+#  SMB DCE/RPC 
 #
 
 import sys
-import os
-import cmd
-import argparse
 import time
 import logging
-import string
-import ntpath
+import argparse
+import cmd
+import os
+import glob
+import errno
 
 from impacket.examples import logger
 from impacket import version
-from impacket.smbconnection import SMBConnection, SMB_DIALECT, SMB2_DIALECT_002, SMB2_DIALECT_21
-from impacket.dcerpc.v5.dcomrt import DCOMConnection
-from impacket.dcerpc.v5.dcom import wmi
+from impacket.dcerpc.v5 import samr, transport, srvs
 from impacket.dcerpc.v5.dtypes import NULL
-
-OUTPUT_FILENAME = '__' + str(time.time())
-CODEC = sys.stdout.encoding
-
-class WMIEXEC:
-    def __init__(self, command='', username='', password='', domain='', hashes=None, aesKey=None, share=None,
-                 noOutput=False, doKerberos=False, kdcHost=None):
-        self.__command = command
-        self.__username = username
-        self.__password = password
-        self.__domain = domain
-        self.__lmhash = ''
-        self.__nthash = ''
-        self.__aesKey = aesKey
-        self.__share = share
-        self.__noOutput = noOutput
-        self.__doKerberos = doKerberos
-        self.__kdcHost = kdcHost
-        self.shell = None
-        if hashes is not None:
-            self.__lmhash, self.__nthash = hashes.split(':')
-
-    def run(self, addr):
-        if self.__noOutput is False:
-            smbConnection = SMBConnection(addr, addr)
-            if self.__doKerberos is False:
-                smbConnection.login(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash)
-            else:
-                smbConnection.kerberosLogin(self.__username, self.__password, self.__domain, self.__lmhash,
-                                            self.__nthash, self.__aesKey, kdcHost=self.__kdcHost)
-
-            dialect = smbConnection.getDialect()
-            if dialect == SMB_DIALECT:
-                logging.info("SMBv1 dialect used")
-            elif dialect == SMB2_DIALECT_002:
-                logging.info("SMBv2.0 dialect used")
-            elif dialect == SMB2_DIALECT_21:
-                logging.info("SMBv2.1 dialect used")
-            else:
-                logging.info("SMBv3.0 dialect used")
-        else:
-            smbConnection = None
-
-        dcom = DCOMConnection(addr, self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash,
-                              self.__aesKey, oxidResolver=True, doKerberos=self.__doKerberos, kdcHost=self.__kdcHost)
-        try:
-            iInterface = dcom.CoCreateInstanceEx(wmi.CLSID_WbemLevel1Login,wmi.IID_IWbemLevel1Login)
-            iWbemLevel1Login = wmi.IWbemLevel1Login(iInterface)
-            iWbemServices= iWbemLevel1Login.NTLMLogin('//./root/cimv2', NULL, NULL)
-            iWbemLevel1Login.RemRelease()
-
-            win32Process,_ = iWbemServices.GetObject('Win32_Process')
-
-            self.shell = RemoteShell(self.__share, win32Process, smbConnection)
-            if self.__command != ' ':
-                self.shell.onecmd(self.__command)
-            else:
-                self.shell.cmdloop()
-        except  (Exception, KeyboardInterrupt), e:
-            if logging.getLogger().level == logging.DEBUG:
-                import traceback
-                traceback.print_exc()
-            logging.error(str(e))
-            if smbConnection is not None:
-                smbConnection.logoff()
-            dcom.disconnect()
-            sys.stdout.flush()
-            sys.exit(1)
-
-        if smbConnection is not None:
-            smbConnection.logoff()
-        dcom.disconnect()
-
-class RemoteShell(cmd.Cmd):
-    def __init__(self, share, win32Process, smbConnection):
-        cmd.Cmd.__init__(self)
-        self.__share = share
-        self.__output = '\\' + OUTPUT_FILENAME
-        self.__outputBuffer = unicode('')
-        self.__shell = 'cmd.exe /Q /c '
-        self.__win32Process = win32Process
-        self.__transferClient = smbConnection
-        self.__pwd = unicode('C:\\')
-        self.__noOutput = False
-        self.intro = '[!] Launching semi-interactive shell - Careful what you execute\n[!] Press help for extra shell commands'
-
-        # We don't wanna deal with timeouts from now on.
-        if self.__transferClient is not None:
-            self.__transferClient.setTimeout(100000)
-            self.do_cd('\\')
-        else:
-            self.__noOutput = True
-
-    def do_shell(self, s):
-        os.system(s)
-
-    def do_help(self, line):
-        print """
- lcd {path}                 - changes the current local directory to {path}
- exit                       - terminates the server process (and this session)
- put {src_file, dst_path}   - uploads a local file to the dst_path (dst_path = default current directory)
- get {file}                 - downloads pathname to the current local dir 
- ! {cmd}                    - executes a local shell cmd
-""" 
-
-    def do_lcd(self, s):
-        if s == '':
-            print os.getcwd()
-        else:
-            try:
-                os.chdir(s)
-            except Exception, e:
-                logging.error(str(e))
-
-    def do_get(self, src_path):
-
-        try:
-            import ntpath
-            newPath = ntpath.normpath(ntpath.join(self.__pwd, src_path))
-            drive, tail = ntpath.splitdrive(newPath) 
-            filename = ntpath.basename(tail)
-            fh = open(filename,'wb')
-            logging.info("Downloading %s\\%s" % (drive, tail))
-            self.__transferClient.getFile(drive[:-1]+'$', tail, fh.write)
-            fh.close()
-
-        except Exception, e:
-            logging.error(str(e))
-
-            if os.path.exists(filename):
-                os.remove(filename)
+from impacket.smbconnection import *
 
 
+# If you wanna have readline like functionality in Windows, install pyreadline
+try:
+  import pyreadline as readline
+except ImportError:
+  import readline
 
-    def do_put(self, s):
-        try:
-            params = s.split(' ')
-            if len(params) > 1:
-                src_path = params[0]
-                dst_path = params[1]
-            elif len(params) == 1:
-                src_path = params[0]
-                dst_path = ''
+basepath = '0'
 
-            src_file = os.path.basename(src_path)
-            fh = open(src_path, 'rb')
-            dst_path = string.replace(dst_path, '/','\\')
-            import ntpath
-            pathname = ntpath.join(ntpath.join(self.__pwd,dst_path), src_file)
-            drive, tail = ntpath.splitdrive(pathname)
-            logging.info("Uploading %s to %s" % (src_file, pathname))
-            self.__transferClient.putFile(drive[:-1]+'$', tail, fh.read)
-            fh.close()
-        except Exception, e:
-            logging.critical(str(e))
+def base(self, s):
+    global basepath
+    basepath = os.getcwd()
+    print(basepath)
+
+def mget(self, filename):
+    if self.tid is None:
+        logging.error("No share selected")
+        return
+    else:
+        filename = string.replace(filename,'/','\\')
+        fh = open(ntpath.basename(filename),'wb')
+        pathname = ntpath.join(self.pwd,filename)
+    try:
+        pwd = ntpath.join(self.pwd,'*')
+        self.completion = []
+        pwd = string.replace(pwd,'/','\\')
+        pwd = ntpath.normpath(pwd)
+        for f in self.smb.listPath(self.share, pwd):
+            if f.get_filesize() > 0:
+                filename = f.get_longname()
+                fh = open(ntpath.basename(filename),'wb')
+                pathname = ntpath.join(self.pwd,f.get_longname())
+                print("Getting file: ", pathname)
+                self.smb.getFile(self.share, pathname, fh.write)
+                fh.close()
+    except:
+        fh.close()
+        os.remove(filename)
+        raise
+    fh.close()
+
+def mkdir_p(path):
+    try:
+        os.makedirs(path)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
             pass
+        else:
+            raise
 
-    def do_exit(self, s):
-        return True
+def ls(self, wildcard, display = True):
+    if self.loggedIn is False:
+        logging.error("Not logged in")
+        return
+    if self.tid is None:
+        logging.error("No share selected")
+        return
+    if wildcard == '':
+       pwd = ntpath.join(self.pwd,'*')
+    else:
+       pwd = ntpath.join(self.pwd, wildcard)
+    self.completion = []
+    pwd = string.replace(pwd,'/','\\')
+    pwd = ntpath.normpath(pwd)
+    for f in self.smb.listPath(self.share, pwd):
+        if display is True:
+            print "%crw-rw-rw- %10d  %s %s" % (
+            'd' if f.is_directory() > 0 else '-', f.get_filesize(), time.ctime(float(f.get_mtime_epoch())),
+            f.get_longname())
+        self.completion.append((f.get_longname(), f.is_directory()))
+
+def cd(self, line):
+    if self.tid is None:
+        logging.error("No share selected")
+        return
+    p = string.replace(line,'/','\\')
+    oldpwd = self.pwd
+    if p[0] == '\\':
+       self.pwd = line
+    else:
+       self.pwd = ntpath.join(self.pwd, line)
+    self.pwd = ntpath.normpath(self.pwd)
+    # Let's try to open the directory to see if it's valid
+    try:
+        fid = self.smb.openFile(self.tid, self.pwd, creationOption = FILE_DIRECTORY_FILE \
+                                , desiredAccess = FILE_READ_DATA | FILE_LIST_DIRECTORY \
+                                , shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE \
+                                )
+        self.smb.closeFile(self.tid,fid)
+    except SessionError:
+        self.pwd = oldpwd
+        raise
+
+def scan(self, wildcard):
+        if self.loggedIn is False:
+            logging.error("Not logged in")
+            return
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+        if wildcard == '':
+           pwd = ntpath.join(self.pwd,'*')
+        else:
+           pwd = ntpath.join(self.pwd, wildcard)
+        self.completion = []
+        pwd = string.replace(pwd,'/','\\')
+        pwd = ntpath.normpath(pwd)
+        dirs , filez = [], []
+        names = self.smb.listPath(self.share, pwd)
+        for name in names:
+            if name.is_directory():
+                if name.get_longname() not in [u'.', u'..']:
+                    dirs.append(ntpath.join(self.pwd, name.get_longname()))
+            else:
+                filez.append(name.get_longname())
+        #if len(dirs) > 0:
+        #    print(dirs)
+        #print(filez)
+        for name in dirs:
+             #basepath = os.path.join(basepath, name)
+             makedir = ntpath.join(self.pwd, name)
+             makedir = string.replace(makedir, '\\', '/')
+             #basepath = string.replace(basepath, '\\', '/')
+             makedir = string.replace(makedir,'//','./')
+             #basepath = string.replace(basepath,'//','/')
+             mkdir_p(basepath + makedir)
+             self.do_cd(makedir)
+             self.do_lcd(basepath + makedir)
+             mget(self, '*')
+             self.do_lcd(basepath + makedir)
+             scan(self, '*')
+             
+
+class MiniImpacketShell(cmd.Cmd):    
+    def __init__(self, smbClient,tcpShell=None):
+        #If the tcpShell parameter is passed (used in ntlmrelayx), 
+        # all input and output is redirected to a tcp socket
+        # instead of to stdin / stdout
+        if tcpShell is not None:
+            cmd.Cmd.__init__(self,stdin=tcpShell,stdout=tcpShell)
+            sys.stdout = tcpShell
+            sys.stdin = tcpShell
+            sys.stderr = tcpShell
+            self.use_rawinput = False
+            self.shell = tcpShell
+        else:
+            cmd.Cmd.__init__(self)
+            self.shell = None
+
+        self.prompt = '# '
+        self.smb = smbClient
+        self.username, self.password, self.domain, self.lmhash, self.nthash, self.aesKey, self.TGT, self.TGS = smbClient.getCredentials()
+        self.tid = None
+        self.intro = 'Type help for list of commands'
+        self.pwd = ''
+        self.share = None
+        self.loggedIn = True
+        self.last_output = None
+        self.completion = []
 
     def emptyline(self):
-        return False
+        pass
 
-    def do_cd(self, s):
-        self.execute_remote('cd ' + s)
-        if len(self.__outputBuffer.strip('\r\n')) > 0:
-            print self.__outputBuffer
-            self.__outputBuffer = u''
+    def precmd(self,line):
+        # switch to unicode
+        return line.decode('utf-8')
+
+    def onecmd(self,s):
+        retVal = False
+        try:
+           retVal = cmd.Cmd.onecmd(self,s)
+        except Exception, e:
+           #import traceback
+           #print traceback.print_exc()
+           logging.error(e)
+
+        return retVal
+
+    def do_exit(self,line):
+        if self.shell is not None:
+            self.shell.close()
+        return True
+
+    def do_shell(self, line):
+        output = os.popen(line).read()
+        print output
+        self.last_output = output
+
+    def do_help(self,line):
+        print """
+ open {host,port=445} - opens a SMB connection against the target host/port
+ login {domain/username,passwd} - logs into the current SMB connection
+ logoff - logs off
+ shares - list available shares
+ use {sharename} - connect to an specific share
+ cd {path} - changes the current directory to {path}
+ lcd {path} - changes the current local directory to {path}
+ pwd - shows current remote directory
+ password - changes the user password, the new password will be prompted for input
+ ls {wildcard} - lists all the files in the current directory
+ rm {file} - removes the selected file
+ mkdir {dirname} - creates the directory under the current path
+ rmdir {dirname} - removes the directory under the current path
+ put {filename} - uploads the filename into the current path
+ get {filename} - downloads the filename from the current path
+ mget * - downloads all files from current remote path to current local directory
+ mput /path/to/files/* or /path/to/file - uploads all files from local path to remote path
+ info - returns NetrServerInfo main results
+ who - returns the sessions currently connected at the target host (admin required)
+ close - disconnect the current Session
+ exit - exit...
+
+"""
+
+    def do_password(self, line):
+        if self.loggedIn is False:
+            logging.error("Not logged in")
+            return
+        from getpass import getpass
+        newPassword = getpass("New Password:")
+        rpctransport = transport.SMBTransport(self.smb.getRemoteHost(), filename = r'\samr', smb_connection = self.smb)
+        dce = rpctransport.get_dce_rpc()
+        dce.connect()                     
+        dce.bind(samr.MSRPC_UUID_SAMR)
+        samr.hSamrUnicodeChangePasswordUser2(dce, '\x00', self.username, self.password, newPassword, self.lmhash, self.nthash)
+        self.password = newPassword
+        self.lmhash = None
+        self.nthash = None
+
+    def do_open(self,line):
+        l = line.split(' ')
+        port = 445
+        if len(l) > 0:
+           host = l[0]
+        if len(l) > 1:
+           port = int(l[1])
+
+        
+        if port == 139:
+            self.smb = SMBConnection('*SMBSERVER', host, sess_port=port)
         else:
-            self.__pwd = ntpath.normpath(ntpath.join(self.__pwd, s.decode(sys.stdin.encoding)))
-            self.execute_remote('cd ')
-            self.__pwd = self.__outputBuffer.strip('\r\n')
-            self.prompt = unicode(self.__pwd + '>').encode(CODEC)
-            self.__outputBuffer = u''
+            self.smb = SMBConnection(host, host, sess_port=port)
 
-    def default(self, line):
-        # Let's try to guess if the user is trying to change drive
-        if len(line) == 2 and line[1] == ':':
-            # Execute the command and see if the drive is valid
-            self.execute_remote(line)
-            if len(self.__outputBuffer.strip('\r\n')) > 0: 
-                # Something went wrong
-                print self.__outputBuffer
-                self.__outputBuffer = u''
-            else:
-                # Drive valid, now we should get the current path
-                self.__pwd = line
-                self.execute_remote('cd ')
-                self.__pwd = self.__outputBuffer.strip('\r\n')
-                self.prompt = unicode(self.__pwd + '>').encode(CODEC)
-                self.__outputBuffer = u''
+        dialect = self.smb.getDialect()
+        if dialect == SMB_DIALECT:
+            logging.info("SMBv1 dialect used")
+        elif dialect == SMB2_DIALECT_002:
+            logging.info("SMBv2.0 dialect used")
+        elif dialect == SMB2_DIALECT_21:
+            logging.info("SMBv2.1 dialect used")
         else:
-            if line != '':
-                self.send_data(line)
+            logging.info("SMBv3.0 dialect used")
 
-    def get_output(self):
-        def output_callback(data):
-            try:
-                self.__outputBuffer += data.decode(CODEC)
-            except UnicodeDecodeError, e:
-                logging.error('Decoding error detected, consider running chcp.com at the target,\nmap the result with '
-                              'https://docs.python.org/2.4/lib/standard-encodings.html\nand then execute wmiexec.py '
-                              'again with -codec and the corresponding codec')
-                self.__outputBuffer += data.decode(CODEC, errors='replace')
+        self.share = None
+        self.tid = None
+        self.pwd = ''
+        self.loggedIn = False
+        self.password = None
+        self.lmhash = None
+        self.nthash = None
+        self.username = None
 
-        if self.__noOutput is True:
-            self.__outputBuffer = u''
+    def do_login(self,line):
+        if self.smb is None:
+            logging.error("No connection open")
+            return
+        l = line.split(' ')
+        username = ''
+        password = ''
+        domain = ''
+        if len(l) > 0:
+           username = l[0]
+        if len(l) > 1:
+           password = l[1]
+
+        if username.find('/') > 0:
+           domain, username = username.split('/')
+
+        if password == '' and username != '':
+            from getpass import getpass
+            password = getpass("Password:")
+
+        self.smb.login(username, password, domain=domain)
+        self.password = password
+        self.username = username
+
+        if self.smb.isGuestSession() > 0:
+            logging.info("GUEST Session Granted")
+        else:
+            logging.info("USER Session Granted")
+        self.loggedIn = True
+
+    def do_kerberos_login(self,line):
+        if self.smb is None:
+            logging.error("No connection open")
+            return
+        l = line.split(' ')
+        username = ''
+        password = ''
+        domain = ''
+        if len(l) > 0:
+           username = l[0]
+        if len(l) > 1:
+           password = l[1]
+
+        if username.find('/') > 0:
+           domain, username = username.split('/')
+
+        if domain == '': 
+            logging.error("Domain must be specified for Kerberos login")
             return
 
-        while True:
-            try:
-                self.__transferClient.getFile(self.__share, self.__output, output_callback)
-                break
-            except Exception, e:
-                if str(e).find('STATUS_SHARING_VIOLATION') >=0:
-                    # Output not finished, let's wait
-                    time.sleep(1)
-                    pass
-                elif str(e).find('Broken') >= 0:
-                    # The SMB Connection might have timed out, let's try reconnecting
-                    logging.debug('Connection broken, trying to recreate it')
-                    self.__transferClient.reconnect()
-                    return self.get_output()
-        self.__transferClient.deleteFile(self.__share, self.__output)
+        if password == '' and username != '':
+            from getpass import getpass
+            password = getpass("Password:")
 
-    def execute_remote(self, data):
-        command = self.__shell + data 
-        if self.__noOutput is False:
-            command += ' 1> ' + '\\\\127.0.0.1\\%s' % self.__share + self.__output  + ' 2>&1'
-        self.__win32Process.Create(command.decode(sys.stdin.encoding), self.__pwd, None)
-        self.get_output()
+        self.smb.kerberosLogin(username, password, domain=domain)
+        self.password = password
+        self.username = username
 
-    def send_data(self, data):
-        self.execute_remote(data)
-        print self.__outputBuffer
-        self.__outputBuffer = u''
-
-class AuthFileSyntaxError(Exception):
-    
-    '''raised by load_smbclient_auth_file if it encounters a syntax error
-    while loading the smbclient-style authentication file.'''
-
-    def __init__(self, path, lineno, reason):
-        self.path=path
-        self.lineno=lineno
-        self.reason=reason
-    
-    def __str__(self):
-        return 'Syntax error in auth file %s line %d: %s' % (
-            self.path, self.lineno, self.reason )
-
-def load_smbclient_auth_file(path):
-
-    '''Load credentials from an smbclient-style authentication file (used by
-    smbclient, mount.cifs and others).  returns (domain, username, password)
-    or raises AuthFileSyntaxError or any I/O exceptions.'''
-
-    lineno=0
-    domain=None
-    username=None
-    password=None
-    for line in open(path):
-        lineno+=1
-
-        line = line.strip()
-
-        if line.startswith('#') or line=='':
-            continue
-            
-        parts = line.split('=',1)
-        if len(parts) != 2:
-            raise AuthFileSyntaxError(path, lineno, 'No "=" present in line')
-        
-        (k,v) = (parts[0].strip(), parts[1].strip())
-        
-        if k=='username':
-            username=v
-        elif k=='password':
-            password=v
-        elif k=='domain':
-            domain=v
+        if self.smb.isGuestSession() > 0:
+            logging.info("GUEST Session Granted")
         else:
-            raise AuthFileSyntaxError(path, lineno, 'Unknown option %s' % repr(k))
-            
-    return (domain, username, password)
+            logging.info("USER Session Granted")
+        self.loggedIn = True
 
-# Process command-line arguments.
-if __name__ == '__main__':
+    def do_login_hash(self,line): 
+        if self.smb is None:
+            logging.error("No connection open")
+            return
+        l = line.split(' ')
+        domain = ''
+        if len(l) > 0:
+           username = l[0]
+        if len(l) > 1:
+           hashes = l[1]
+        else:
+           logging.error("Hashes needed. Format is lmhash:nthash")
+           return
+
+        if username.find('/') > 0:
+           domain, username = username.split('/')
+       
+        lmhash, nthash = hashes.split(':')
+
+        self.smb.login(username, '', domain,lmhash=lmhash, nthash=nthash)
+        self.username = username
+        self.lmhash = lmhash
+        self.nthash = nthash
+
+        if self.smb.isGuestSession() > 0:
+            logging.info("GUEST Session Granted")
+        else:
+            logging.info("USER Session Granted")
+        self.loggedIn = True
+
+    def do_logoff(self, line):
+        if self.smb is None:
+            logging.error("No connection open")
+            return
+        self.smb.logoff()
+        del self.smb
+        self.share = None
+        self.smb = None
+        self.tid = None
+        self.pwd = ''
+        self.loggedIn = False
+        self.password = None
+        self.lmhash = None
+        self.nthash = None
+        self.username = None
+
+    def do_scan(self, wildcard):
+        scan(self, wildcard)
+
+    def do_info(self, line):
+        if self.loggedIn is False:
+            logging.error("Not logged in")
+            return
+        rpctransport = transport.SMBTransport(self.smb.getRemoteHost(), filename = r'\srvsvc', smb_connection = self.smb)
+        dce = rpctransport.get_dce_rpc()
+        dce.connect()                     
+        dce.bind(srvs.MSRPC_UUID_SRVS)
+        resp = srvs.hNetrServerGetInfo(dce, 102)
+
+        print "Version Major: %d" % resp['InfoStruct']['ServerInfo102']['sv102_version_major']
+        print "Version Minor: %d" % resp['InfoStruct']['ServerInfo102']['sv102_version_minor']
+        print "Server Name: %s" % resp['InfoStruct']['ServerInfo102']['sv102_name']
+        print "Server Comment: %s" % resp['InfoStruct']['ServerInfo102']['sv102_comment']
+        print "Server UserPath: %s" % resp['InfoStruct']['ServerInfo102']['sv102_userpath']
+        print "Simultaneous Users: %d" % resp['InfoStruct']['ServerInfo102']['sv102_users']
+         
+    def do_who(self, line):
+        if self.loggedIn is False:
+            logging.error("Not logged in")
+            return
+        rpctransport = transport.SMBTransport(self.smb.getRemoteHost(), filename = r'\srvsvc', smb_connection = self.smb)
+        dce = rpctransport.get_dce_rpc()
+        dce.connect()                     
+        dce.bind(srvs.MSRPC_UUID_SRVS)
+        resp = srvs.hNetrSessionEnum(dce, NULL, NULL, 10)
+
+        for session in resp['InfoStruct']['SessionInfo']['Level10']['Buffer']:
+            print "host: %15s, user: %5s, active: %5d, idle: %5d" % (
+            session['sesi10_cname'][:-1], session['sesi10_username'][:-1], session['sesi10_time'],
+            session['sesi10_idle_time'])
+
+    def do_shares(self, line):
+        if self.loggedIn is False:
+            logging.error("Not logged in")
+            return
+        resp = self.smb.listShares()
+        for i in range(len(resp)):                        
+            print resp[i]['shi1_netname'][:-1]
+
+    def do_use(self,line):
+        if self.loggedIn is False:
+            logging.error("Not logged in")
+            return
+        self.share = line
+        self.tid = self.smb.connectTree(line)
+        self.pwd = '\\'
+        self.do_ls('', False)
+
+    def complete_cd(self, text, line, begidx, endidx):
+        return self.complete_get(text, line, begidx, endidx, include = 2)
+
+    def do_cd(self, line):
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+        p = string.replace(line,'/','\\')
+        oldpwd = self.pwd
+        if p[0] == '\\':
+           self.pwd = line
+        else:
+           self.pwd = ntpath.join(self.pwd, line)
+        self.pwd = ntpath.normpath(self.pwd)
+        # Let's try to open the directory to see if it's valid
+        try:
+            fid = self.smb.openFile(self.tid, self.pwd, creationOption = FILE_DIRECTORY_FILE \
+                                    , desiredAccess = FILE_READ_DATA | FILE_LIST_DIRECTORY \
+                                    , shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE \
+                                    )
+            self.smb.closeFile(self.tid,fid)
+        except SessionError:
+            self.pwd = oldpwd
+            raise
+
+    def do_base(self, s):
+        base(self, s)
+
+    def do_lcd(self, s):
+        print s
+        if s == '':
+           print os.getcwd()
+        else:
+           os.chdir(s)
+
+    def do_pwd(self,line):
+        if self.loggedIn is False:
+            logging.error("Not logged in")
+            return
+        print self.pwd
+
+    def do_ls(self, wildcard, display = True):
+        if self.loggedIn is False:
+            logging.error("Not logged in")
+            return
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+        if wildcard == '':
+           pwd = ntpath.join(self.pwd,'*')
+        else:
+           pwd = ntpath.join(self.pwd, wildcard)
+        self.completion = []
+        pwd = string.replace(pwd,'/','\\')
+        pwd = ntpath.normpath(pwd)
+        for f in self.smb.listPath(self.share, pwd):
+            if display is True:
+                print "%crw-rw-rw- %10d  %s %s" % (
+                'd' if f.is_directory() > 0 else '-', f.get_filesize(), time.ctime(float(f.get_mtime_epoch())),
+                f.get_longname())
+            self.completion.append((f.get_longname(), f.is_directory()))
+
+
+    def do_rm(self, filename):
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+        f = ntpath.join(self.pwd, filename)
+        file = string.replace(f,'/','\\')
+        self.smb.deleteFile(self.share, file)
+ 
+    def do_mkdir(self, path):
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+        p = ntpath.join(self.pwd, path)
+        pathname = string.replace(p,'/','\\')
+        self.smb.createDirectory(self.share,pathname)
+
+    def do_rmdir(self, path):
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+        p = ntpath.join(self.pwd, path)
+        pathname = string.replace(p,'/','\\')
+        self.smb.deleteDirectory(self.share, pathname)
+
+    def do_put(self, pathname):
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+        src_path = pathname
+        dst_name = os.path.basename(src_path)
+
+        fh = open(pathname, 'rb')
+        f = ntpath.join(self.pwd,dst_name)
+        finalpath = string.replace(f,'/','\\')
+        self.smb.putFile(self.share, finalpath, fh.read)
+        fh.close()
+
+    def do_mput(self, pathname):
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+
+        files = glob.glob(pathname)
+        for dest in files:
+            push = os.path.join(pathname, dest)
+        for file in files:
+            if file != '*':
+                pathname = file
+                src_path = pathname
+                dst_name = os.path.basename(src_path)
+                fh = open(pathname, 'rb')
+                f = ntpath.join(self.pwd,dst_name)
+                finalpath = string.replace(f,'/','\\')
+                print("Sending file: ", pathname)
+                self.smb.putFile(self.share, finalpath, fh.read)
+                fh.close()
+        print("Done!")
+
+    def complete_get(self, text, line, begidx, endidx, include = 1):
+        # include means
+        # 1 just files
+        # 2 just directories
+        p = string.replace(line,'/','\\') 
+        if p.find('\\') < 0:
+            items = []
+            if include == 1:
+                mask = 0
+            else:
+                mask = 0x010
+            for i in self.completion:
+                if i[1] == mask:
+                    items.append(i[0])
+            if text:
+                return  [
+                    item for item in items
+                    if item.upper().startswith(text.upper())
+                ]
+            else:
+                return items
+
+    def do_get(self, filename):
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+        else:        
+            filename = string.replace(filename,'/','\\')
+            fh = open(ntpath.basename(filename),'wb')
+            pathname = ntpath.join(self.pwd,filename)
+        try:
+            self.smb.getFile(self.share, pathname, fh.write)
+        except:
+            fh.close()
+            os.remove(filename)
+            raise
+        fh.close()
+
+    def do_mget(self, filename):
+        if self.tid is None:
+            logging.error("No share selected")
+            return
+        else:        
+            filename = string.replace(filename,'/','\\')
+            fh = open(ntpath.basename(filename),'wb')
+            pathname = ntpath.join(self.pwd,filename)
+        try:
+            pwd = ntpath.join(self.pwd,'*')
+            self.completion = []
+            pwd = string.replace(pwd,'/','\\')
+            pwd = ntpath.normpath(pwd)
+            for f in self.smb.listPath(self.share, pwd):
+                if f.get_filesize() > 0:
+                    filename = f.get_longname()
+                    fh = open(ntpath.basename(filename),'wb')
+                    pathname = ntpath.join(self.pwd,f.get_longname())
+                    print("Getting file: ", pathname)
+                    self.smb.getFile(os.path, pathname, fh.write)
+                    fh.close()
+        except:
+            fh.close()
+            os.remove(filename)
+            raise
+        fh.close()
+
+    def do_close(self, line):
+        self.do_logoff(line)
+
+def main():
     # Init the example's logger theme
     logger.init()
     print version.BANNER
+    parser = argparse.ArgumentParser(add_help = True, description = "SMB client implementation.")
 
-    parser = argparse.ArgumentParser(add_help = True, description = "Executes a semi-interactive shell using Windows "
-                                                                    "Management Instrumentation.")
     parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName or address>')
-    parser.add_argument('-share', action='store', default = 'ADMIN$', help='share where the output will be grabbed from '
-                                                                           '(default ADMIN$)')
-    parser.add_argument('-nooutput', action='store_true', default = False, help='whether or not to print the output '
-                                                                                '(no SMB connection created)')
+    parser.add_argument('-file', type=argparse.FileType('r'), help='input file with commands to execute in the mini shell')
     parser.add_argument('-debug', action='store_true', help='Turn DEBUG output ON')
-    parser.add_argument('-codec', action='store', help='Sets encoding used (codec) from the target\'s output (default '
-                                                       '"%s"). If errors are detected, run chcp.com at the target, '
-                                                       'map the result with '
-                          'https://docs.python.org/2.4/lib/standard-encodings.html and then execute wmiexec.py '
-                          'again with -codec and the corresponding codec ' % CODEC)
-
-    parser.add_argument('command', nargs='*', default = ' ', help='command to execute at the target. If empty it will '
-                                                                  'launch a semi-interactive shell')
 
     group = parser.add_argument_group('authentication')
 
     group.add_argument('-hashes', action="store", metavar = "LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
     group.add_argument('-no-pass', action="store_true", help='don\'t ask for password (useful for -k)')
     group.add_argument('-k', action="store_true", help='Use Kerberos authentication. Grabs credentials from ccache file '
-                       '(KRB5CCNAME) based on target parameters. If valid credentials cannot be found, it will use the '
-                       'ones specified in the command line')
+                                                       '(KRB5CCNAME) based on target parameters. If valid credentials '
+                                                       'cannot be found, it will use the ones specified in the command '
+                                                       'line')
     group.add_argument('-aesKey', action="store", metavar = "hex key", help='AES key to use for Kerberos Authentication '
                                                                             '(128 or 256 bits)')
-    group.add_argument('-dc-ip', action='store',metavar = "ip address",  help='IP Address of the domain controller. If '
-                       'ommited it use the domain part (FQDN) specified in the target parameter')
-    group.add_argument('-A', action="store", metavar = "authfile", help="smbclient/mount.cifs-style authentication file. "
-                                                                        "See smbclient man page's -A option.")
+
+    group = parser.add_argument_group('connection')
+
+    group.add_argument('-dc-ip', action='store', metavar="ip address",
+                       help='IP Address of the domain controller. If omitted it will use the domain part (FQDN) specified in '
+                            'the target parameter')
+    group.add_argument('-target-ip', action='store', metavar="ip address",
+                       help='IP Address of the target machine. If omitted it will use whatever was specified as target. '
+                            'This is useful when target is the NetBIOS name and you cannot resolve it')
+    group.add_argument('-port', choices=['139', '445'], nargs='?', default='445', metavar="destination port",
+                       help='Destination port to connect to SMB Server')
 
     if len(sys.argv)==1:
         parser.print_help()
@@ -363,23 +673,12 @@ if __name__ == '__main__':
 
     options = parser.parse_args()
 
-    if options.codec is not None:
-        CODEC = options.codec
-    else:
-        if CODEC is None:
-            CODEC = 'UTF-8'
-
-    if ' '.join(options.command) == ' ' and options.nooutput is True:
-        logging.error("-nooutput switch and interactive shell not supported")
-        sys.exit(1)
-    
     if options.debug is True:
         logging.getLogger().setLevel(logging.DEBUG)
     else:
         logging.getLogger().setLevel(logging.INFO)
 
     import re
-
     domain, username, password, address = re.compile('(?:(?:([^/@:]*)/)?([^@:]*)(?::([^@]*))?@)?(.*)').match(
         options.target).groups('')
 
@@ -388,31 +687,49 @@ if __name__ == '__main__':
         password = password + '@' + address.rpartition('@')[0]
         address = address.rpartition('@')[2]
 
-    try:
-        if options.A is not None:
-            (domain, username, password) = load_smbclient_auth_file(options.A)
-            logging.debug('loaded smbclient auth file: domain=%s, username=%s, password=%s' % (repr(domain), repr(username), repr(password)))
-        
-        if domain is None:
-            domain = ''
+    if options.target_ip is None:
+        options.target_ip = address
 
-        if password == '' and username != '' and options.hashes is None and options.no_pass is False and options.aesKey is None:
-            from getpass import getpass
-            password = getpass("Password:")
+    if domain is None:
+        domain = ''
+    
+    if password == '' and username != '' and options.hashes is None and options.no_pass is False and options.aesKey is None:
+        from getpass import getpass
+        password = getpass("Password:")
 
-        if options.aesKey is not None:
-            options.k = True
+    if options.aesKey is not None:
+        options.k = True
 
-        executer = WMIEXEC(' '.join(options.command), username, password, domain, options.hashes, options.aesKey,
-                           options.share, options.nooutput, options.k, options.dc_ip)
-        executer.run(address)
-    except KeyboardInterrupt, e:
-        logging.error(str(e))
+    if options.hashes is not None:
+        lmhash, nthash = options.hashes.split(':')
+    else:
+        lmhash = ''
+        nthash = ''
+ 
+    try: 
+        smbClient = SMBConnection(address, options.target_ip, sess_port=int(options.port))
+        if options.k is True:
+            smbClient.kerberosLogin(username, password, domain, lmhash, nthash, options.aesKey, options.dc_ip )
+        else:
+            smbClient.login(username, password, domain, lmhash, nthash)
+
+        shell = MiniImpacketShell(smbClient)
+
+        if options.file is not None:
+            logging.info("Executing commands from %s" % options.file.name)
+            for line in options.file.readlines():
+                if line[0] != '#':
+                    print "# %s" % line,
+                    shell.onecmd(line)
+                else:
+                    print line,
+        else:
+            shell.cmdloop()
     except Exception, e:
-        if logging.getLogger().level == logging.DEBUG:
-            import traceback
-            traceback.print_exc()
+        #import traceback
+        #print traceback.print_exc()
         logging.error(str(e))
-        sys.exit(1)
-        
-    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+
